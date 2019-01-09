@@ -1,0 +1,154 @@
+import java.text.DateFormat
+import net.masterthought.cucumber.Configuration
+import net.masterthought.cucumber.ReportBuilder
+import groovyx.gpars.GParsPool
+import org.testng.Assert
+
+apply plugin: 'groovy'
+apply plugin: 'java'
+
+group 'Sample-Appium-Framework'
+version '1.0-SNAPSHOT'
+
+sourceCompatibility = 1.8
+
+repositories {
+    mavenCentral()
+}
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath "org.codehaus.gpars:gpars:1.2.1",
+                "net.masterthought:cucumber-reporting:3.11.0",
+                "org.testng:testng:6.14.3"
+    }
+}
+
+dependencies {
+    compile group: 'io.appium', name: 'java-client', version: '6.1.0'
+    compile group: 'info.cukes', name: 'cucumber-jvm', version: '1.2.5', ext: 'pom'
+    compile group: 'info.cukes', name: 'cucumber-java', version: '1.2.5'
+    testCompile group: 'info.cukes', name: 'cucumber-junit', version: '1.2.5'
+    testCompile group: 'org.testng', name: 'testng', version: '6.14.3'
+}
+
+task generateReport() {
+    doLast {
+        def jsonReports = project.fileTree(dir: "${reporting.baseDir}/cucumber/").include '**/*.json'.toString()
+        File reportOutputDirectory = new File("${reporting.baseDir}/cucumber")
+
+        List<String> jsonReportFiles = new ArrayList<String>()
+        jsonReports.each { File file ->
+            jsonReportFiles.add("${reporting.baseDir}/cucumber/${file.name}".toString())
+        }
+
+        String buildNumber = DateFormat.instance.format(new Date())
+        String projectName = "Sample Appium Framework"
+        boolean runWithJenkins = false
+
+        Configuration configuration = new Configuration(reportOutputDirectory, projectName)
+        configuration.setRunWithJenkins(runWithJenkins)
+        configuration.setBuildNumber(buildNumber)
+
+        ReportBuilder reportBuilder = new ReportBuilder(jsonReportFiles, configuration)
+        def reports = reportBuilder.generateReports()
+        println("\nReport available on: ${reporting.baseDir}/cucumber/cucumber-html-reports/overview-features.html")
+        Assert.assertEquals(reports.failedScenarios, 0, "There are some failed scenarios in the build")
+    }
+}
+
+def getDevices() {
+    def deviceIds = []
+    def stdout = new ByteArrayOutputStream()
+    exec {
+        if (System.getProperty("testFor") == 'Android') {
+            commandLine "adb", "devices", "-l"
+        } else {
+            commandLine "instruments", "-s", "devices", "|", "grep", "'iPhone'"
+        }
+        standardOutput = stdout
+    }
+    Scanner scan = new Scanner(stdout.toString())
+    while (scan.hasNextLine()) {
+        String oneLine = scan.nextLine()
+        if (oneLine.contains("model")) {
+            def deviceId = oneLine.split("device")[0].trim()
+            deviceIds.add(deviceId)
+            println "Adding device == " + deviceId
+        }
+    }
+    return deviceIds
+}
+
+private static String getTags() {
+    def tags = System.getProperty("tags")
+    if (tags != null)
+        return tags
+    return "~wip"
+}
+
+task runFragmentation() {
+    doLast {
+        def devices = getDevices()
+        def poolSize = devices.size()
+        println "Total number of connected device -- " + poolSize
+        GParsPool.withPool(poolSize) {
+            devices.eachParallel { String device ->
+                javaexec {
+                    ignoreExitValue = false
+                    main = "cucumber.api.cli.Main"
+                    classpath = sourceSets.test.runtimeClasspath
+                    args = getArgsForFragmentation(device)
+                    systemProperties = [
+                            "testFor": System.getProperty("testFor"),
+                            "udid"   : System.setProperty("udid", device)
+                    ]
+                }
+            }
+        }
+    }
+}
+runFragmentation.finalizedBy(generateReport)
+
+task runDistribution() {
+    doLast {
+        def devices = getDevices()
+        def poolSize = devices.size()
+        println "Total number of connected device -- " + poolSize
+        def features = fileTree(dir: "${project.projectDir}/src/test/resources/").include '**/*.feature'
+        GParsPool.withPool(poolSize) {
+            features.eachParallel { File file ->
+                javaexec {
+                    ignoreExitValue = false
+                    main = "cucumber.api.cli.Main"
+                    classpath = sourceSets.test.runtimeClasspath
+                    args = getArgsForDistribution(file)
+                    systemProperties = [
+                            "testFor": System.getProperty("testFor"),
+                            "udid"   : System.setProperty("udid", devices.get(0) as String)
+                    ]
+                }
+            }
+        }
+    }
+}
+runDistribution.finalizedBy(generateReport)
+
+static String updateReportFileName(String name) {
+    String[] deviceIdString = name.split(":")
+    return deviceIdString.length > 1 ? "emulator_" + deviceIdString[0].substring(deviceIdString[0].lastIndexOf(".") + 1) : name
+}
+
+def getArgsForFragmentation(String udid) {
+    ["-p", "pretty", "-p", "json:${reporting.baseDir}/cucumber/" + updateReportFileName(udid) + ".json", "--glue", "steps", "-t", tags,
+     "${project.projectDir}/src/test/resources/"]
+}
+
+def getArgsForDistribution(File file) {
+    ["-p", "pretty", "-p", "json:${reporting.baseDir}/cucumber/${file.name}.json", "--glue", "steps", "-t", tags,
+     "${project.projectDir}/src/test/resources/"]
+}
